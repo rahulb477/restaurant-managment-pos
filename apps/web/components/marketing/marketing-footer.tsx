@@ -35,7 +35,7 @@ export function MarketingFooter() {
       <div className="mx-auto max-w-6xl">
         <div className="grid gap-10 sm:grid-cols-[1.5fr_repeat(3,1fr)]">
           <div>
-            <Link href="/" className="flex items-center gap-2.5">
+            <Link href="/about" className="flex items-center gap-2.5">
               <Logo size={28} />
               <span className="text-sm font-semibold text-foreground">OrderRestro</span>
             </Link>

@@ -1,13 +1,16 @@
 "use client";
 
-import { permissionSatisfied, type LoginDto, type RegisterDto, type SessionUser } from "@nodedr-restaurant/types";
+import { permissionSatisfied, type LoginDto, type SessionUser } from "@nodedr-restaurant/types";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import type { SetupAccess, SignupDto } from "@/lib/onboarding";
+
+type AuthResult = { user: SessionUser; setup: SetupAccess };
 
 export function useCurrentUser() {
   return useQuery({
     queryKey: ["auth", "me"],
-    queryFn: () => api.get<{ user: SessionUser }>("/auth/me"),
+    queryFn: () => api.get<AuthResult>("/auth/me"),
     retry: false,
   });
 }
@@ -15,11 +18,10 @@ export function useCurrentUser() {
 export function useLogin() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (dto: LoginDto) => api.post<{ user: SessionUser }>("/auth/login", dto),
+    mutationFn: (dto: LoginDto) => api.post<AuthResult>("/auth/login", dto),
     onSuccess: (data) => {
-      // Anything cached before this login belongs to nobody (or to the previous
-      // user): drop it so branches and the rest load fresh for this account.
-      queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== "auth" });
+      // No cached tenant data may survive a change of account.
+      queryClient.clear();
       queryClient.setQueryData(["auth", "me"], data);
     },
   });
@@ -28,8 +30,9 @@ export function useLogin() {
 export function useRegister() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (dto: RegisterDto) => api.post<{ user: SessionUser }>("/auth/register", dto),
+    mutationFn: (dto: SignupDto) => api.post<AuthResult>("/auth/register", dto),
     onSuccess: (data) => {
+      queryClient.clear();
       queryClient.setQueryData(["auth", "me"], data);
     },
   });

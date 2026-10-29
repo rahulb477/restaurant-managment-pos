@@ -1,12 +1,11 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { registerSchema, type RegisterDto } from "@nodedr-restaurant/types";
+import { signupSchema, type SignupDto } from "@/lib/onboarding";
 import { motion, useReducedMotion } from "motion/react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
-import { toast } from "sonner";
+import { useState } from "react";
 import { Logo } from "@/components/layout/logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,20 +15,21 @@ import { useRegister } from "@/hooks/use-auth";
 import { ApiError } from "@/lib/api";
 
 export default function SignupPage() {
-  const router = useRouter();
   const register = useRegister();
+  const [error, setError] = useState<string | null>(null);
   const prefersReducedMotion = useReducedMotion();
   const {
     register: field,
     handleSubmit,
     formState: { errors },
-  } = useForm<RegisterDto>({ resolver: zodResolver(registerSchema) });
+  } = useForm<SignupDto>({ resolver: zodResolver(signupSchema) });
 
-  const onSubmit = (dto: RegisterDto) => {
+  const onSubmit = (dto: SignupDto) => {
+    setError(null);
     register.mutate(dto, {
-      onSuccess: () => router.push("/dashboard"),
+      onSuccess: () => window.location.replace("/"),
       onError: (err) => {
-        toast.error(err instanceof ApiError ? err.message : "Something went wrong");
+        setError(err instanceof ApiError ? err.message : "Can't reach the server. Please try again.");
       },
     });
   };
@@ -53,36 +53,10 @@ export default function SignupPage() {
           <h1 className="text-2xl font-semibold tracking-tight text-foreground">
             Nodedr OrderRestro
           </h1>
-          <p className="text-sm text-muted-foreground">Set up your restaurant</p>
+          <p className="text-sm text-muted-foreground">Create your account, then set up your restaurant</p>
         </div>
 
         <form onSubmit={handleSubmit(onSubmit)} className="flex flex-col gap-5">
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="restaurantName">Restaurant name</Label>
-            <Input
-              id="restaurantName"
-              autoComplete="organization"
-              placeholder="e.g. Spice Route"
-              {...field("restaurantName")}
-            />
-            {errors.restaurantName && (
-              <p className="text-xs text-destructive">{errors.restaurantName.message}</p>
-            )}
-          </div>
-
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="branchName">First branch name</Label>
-            <Input
-              id="branchName"
-              placeholder="Main Branch"
-              defaultValue="Main Branch"
-              {...field("branchName")}
-            />
-            {errors.branchName && (
-              <p className="text-xs text-destructive">{errors.branchName.message}</p>
-            )}
-          </div>
-
           <div className="flex flex-col gap-2">
             <Label htmlFor="ownerName">Your name</Label>
             <Input
@@ -121,6 +95,12 @@ export default function SignupPage() {
               <p className="text-xs text-destructive">{errors.password.message}</p>
             )}
           </div>
+
+          {error && (
+            <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+              {error}
+            </div>
+          )}
 
           <Button type="submit" className="mt-2 h-11" disabled={register.isPending}>
             {register.isPending ? "Creating your account…" : "Create account"}

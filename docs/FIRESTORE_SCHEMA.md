@@ -6,9 +6,9 @@ Derived from `apps/backend/prisma/schema.prisma`. Documents are scoped by `resta
 
 Top-level collections (not SQL-table clones):
 
-- `restaurants/{restaurantId}`
-- `branches/{branchId}` — `restaurantId`
-- `users/{userId}` — `restaurantId`, `firebaseUid`, `roleId`, `isActive`, `email`, `name` (no password)
+- `restaurants/{restaurantId}` — `name`, `currency`, `timezone`, `setupComplete`, `setupCompletedAt`, `ownerUid` for new setups
+- `branches/{branchId}` — `restaurantId`, `name`, optional `address`/`phone`/`taxId`, `country`, `taxRegime`, `taxMode`
+- `users/{userId}` — `restaurantId`, `firebaseUid`, `roleId`, `isActive`, `email`, `name` (no password). A newly registered web account has no restaurant yet and has `onboarding.canCreateRestaurant: true` until its setup transaction commits.
 - `roles/{roleId}` — `restaurantId`, `name`
 - `rolePermissions/{id}` — `roleId`, `permissionKey`
 - `permissions/{key}` — global catalog
@@ -43,7 +43,7 @@ Top-level collections (not SQL-table clones):
 
 ## Idempotency
 
-`orders.requestId` unique per branch. Checkout retries reuse the same payment docs.
+`orders.requestId` is scoped per branch. Checkout retries reuse the same payment docs. Restaurant setup re-reads and updates the pending user document in a Firestore transaction, serializing concurrent retries; the completion marker is committed with restaurant, branch, roles and membership. Existing named restaurants with an active named branch but no marker remain complete for compatibility.
 
 ## Concurrency
 

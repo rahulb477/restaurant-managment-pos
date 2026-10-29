@@ -1,10 +1,11 @@
 export class HttpError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    public code?: string,
-  ) {
+  status: number;
+  code?: string;
+
+  constructor(status: number, message: string, code?: string) {
     super(message);
+    this.status = status;
+    this.code = code;
   }
 }
 
@@ -22,8 +23,10 @@ export function errorResponse(err: unknown) {
   if (err instanceof Error && "status" in err && typeof (err as { status: unknown }).status === "number") {
     return json({ message: err.message }, (err as { status: number }).status);
   }
-  const message = err instanceof Error ? err.message : "Request failed";
-  return json({ message }, 500);
+  // Unexpected SDK errors can contain server configuration details. Never
+  // echo them to a client (including Firebase service-account information).
+  console.error("Unexpected API request failure");
+  return json({ message: "Request failed. Please try again." }, 500);
 }
 
 export function requireBranchId(url: URL): string {

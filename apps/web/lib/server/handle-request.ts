@@ -1,22 +1,26 @@
 import {
-  DEFAULT_ROLE_PERMISSIONS,
-  PERMISSIONS,
-  STAFF_ROLES,
+  branchSettingsSchema,
   loginSchema,
-  registerSchema,
+  restaurantSettingsSchema,
   type SessionUser,
 } from "@nodedr-restaurant/types";
 import { randomUUID } from "node:crypto";
+import { signupSchema } from "../onboarding";
 import { computeBill, priceLine, round2, settlePayments } from "./billing";
 import { adminAuth, db, firebaseConfigured } from "./firebase";
 import { HttpError, requireBranchId } from "./http";
 import { uploadToImgbb } from "./imgbb";
 import {
+  accountFromSessionToken,
   clearSessionCookie,
+  requireAccount,
   requirePermission,
-  requireUser,
+  requireReadyUser,
+  SESSION_MS,
   setSessionCookie,
 } from "./session";
+import { completeRestaurantSetup, getSetupDetails, publicSetupAccess } from "./onboarding";
+import { belongsToBranch } from "./tenant";
 import {
   assertBranch,
   createOwned,
@@ -26,12 +30,14 @@ import {
   patchOwned,
 } from "./store";
 
-const SESSION_MS = 12 * 60 * 60 * 1000;
+function firebaseWebApiKey(): string {
+  const apiKey = process.env.FIREBASE_WEB_API_KEY || process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
+  if (!apiKey) throw new HttpError(503, "FIREBASE_WEB_API_KEY / NEXT_PUBLIC_FIREBASE_API_KEY missing");
+  return apiKey;
+}
 
 async function signInPassword(email: string, password: string): Promise<string> {
-  const apiKey =
-    process.env.FIREBASE_WEB_API_KEY ?? process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
-  if (!apiKey) throw new HttpError(503, "FIREBASE_WEB_API_KEY / NEXT_PUBLIC_FIREBASE_API_KEY missing");
+  const apiKey = firebaseWebApiKey();
   const res = await fetch(
     `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(apiKey)}`,
     {
@@ -42,6 +48,9 @@ async function signInPassword(email: string, password: string): Promise<string> 
   );
   const json = (await res.json()) as { idToken?: string; error?: { message?: string } };
   if (!res.ok || !json.idToken) {
+    if (res.status >= 500 || res.status === 429) {
+      throw new HttpError(503, "Firebase sign-in is temporarily unavailable");
+    }
     throw new HttpError(401, "Invalid email or password");
   }
   return json.idToken;
@@ -59,73 +68,55 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
   const { method, parts, url, body } = ctx;
   const p = parts.join("/");
 
-  if (p === "auth/setup-status" && method === "GET") {
-    if (!firebaseConfigured()) return { isSetup: false };
-    const restaurants = await db().collection("restaurants").limit(1).get();
-    return { isSetup: restaurants.docs.length > 0 };
-  }
-
   if (p === "auth/register" && method === "POST") {
     needFirebase();
-    const dto = registerSchema.parse(body);
+    firebaseWebApiKey(); // Do not create an account if sign-in is not configured.
+    const dto = signupSchema.parse(body);
     const existing = await db().collection("users").where("email", "==", dto.email).limit(1).get();
-    if (existing.docs.length) throw new HttpError(400, "An account with this email already exists");
-    const rec = await adminAuth().createUser({
-      email: dto.email,
-      password: dto.password,
-      displayName: dto.ownerName,
-    });
-    const restaurantId = randomUUID();
-    const branchId = randomUUID();
-    const roleId = randomUUID();
-    const userId = rec.uid;
-    const permissions = PERMISSIONS.map((x) => x.key);
-    await db().collection("restaurants").doc(restaurantId).set({
-      name: dto.restaurantName,
-      currency: "INR",
-      timezone: "Asia/Kolkata",
-      createdAt: new Date().toISOString(),
-    });
-    await db().collection("branches").doc(branchId).set({
-      restaurantId,
-      name: dto.branchName,
-      taxRegime: "INDIA_GST",
-      taxMode: "INCLUSIVE",
-      country: "IN",
-      isActive: true,
-    });
-    for (const roleName of STAFF_ROLES) {
-      const id = roleName === "OWNER" ? roleId : randomUUID();
-      await db().collection("roles").doc(id).set({
-        restaurantId,
-        name: roleName,
-        label: roleName.replace(/_/g, " "),
-        permissions: DEFAULT_ROLE_PERMISSIONS[roleName],
+    if (existing.docs.length) throw new HttpError(409, "An account with this email already exists");
+
+    let rec: { uid: string };
+    try {
+      rec = await adminAuth().createUser({
+        email: dto.email,
+        password: dto.password,
+        displayName: dto.ownerName,
       });
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (code === "auth/email-already-exists") throw new HttpError(409, "An account with this email already exists");
+      throw error;
     }
-    await db().collection("users").doc(userId).set({
-      restaurantId,
-      email: dto.email,
-      name: dto.ownerName,
-      roleId,
-      roleName: "OWNER",
-      permissions,
-      isActive: true,
-      firebaseUid: rec.uid,
-    });
-    const idToken = await signInPassword(dto.email, dto.password);
-    const cookie = await adminAuth().createSessionCookie(idToken, { expiresIn: SESSION_MS });
-    await setSessionCookie(cookie);
-    return {
-      user: {
-        id: userId,
-        restaurantId,
+
+    // No tenant or owner permissions are granted until setup commits. Only
+    // this trusted registration handler can grant eligibility to create one.
+    try {
+      await db().collection("users").doc(rec.uid).set({
+        firebaseUid: rec.uid,
+        email: dto.email,
         name: dto.ownerName,
-        roleId,
-        roleName: "OWNER",
-        permissions,
-      } satisfies SessionUser,
-    };
+        isActive: true,
+        onboarding: { canCreateRestaurant: true },
+        createdAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      // Avoid leaving a Firebase Auth account that can never complete signup.
+      try { await adminAuth().deleteUser(rec.uid); } catch { /* operator may need to clean up */ }
+      throw error;
+    }
+
+    try {
+      const idToken = await signInPassword(dto.email, dto.password);
+      const cookie = await adminAuth().createSessionCookie(idToken, { expiresIn: SESSION_MS });
+      const account = await accountFromSessionToken(cookie);
+      const setup = publicSetupAccess(await getSetupDetails(db(), account));
+      await setSessionCookie(cookie);
+      return { user: account.user, setup };
+    } catch {
+      // The account document exists, so do not delete it if only sign-in or
+      // cookie issuance failed. The user can retry by signing in normally.
+      throw new HttpError(503, "Account created, but sign-in failed. Please sign in to continue.");
+    }
   }
 
   if (p === "auth/login" && method === "POST") {
@@ -133,22 +124,11 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
     const dto = loginSchema.parse(body);
     const idToken = await signInPassword(dto.email, dto.password);
     const cookie = await adminAuth().createSessionCookie(idToken, { expiresIn: SESSION_MS });
+    // Resolve identity and restaurant membership before issuing the cookie.
+    const account = await accountFromSessionToken(cookie);
+    const setup = publicSetupAccess(await getSetupDetails(db(), account));
     await setSessionCookie(cookie);
-    const users = await db().collection("users").where("email", "==", dto.email).limit(1).get();
-    if (!users.docs.length) throw new HttpError(401, "Invalid email or password");
-    const u = users.docs[0];
-    const d = u.data();
-    if (d.isActive === false) throw new HttpError(401, "Session no longer valid");
-    return {
-      user: {
-        id: u.id,
-        restaurantId: d.restaurantId,
-        name: d.name,
-        roleId: d.roleId,
-        roleName: d.roleName,
-        permissions: d.permissions ?? [],
-      },
-    };
+    return { user: account.user, setup };
   }
 
   if (p === "auth/logout" && method === "POST") {
@@ -168,10 +148,20 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
     return { ok: true };
   }
 
-  if (p === "auth/me" && method === "GET") {
-    const user = await requireUser();
-    return { user };
+  if ((p === "auth/me" || p === "auth/setup-status") && method === "GET") {
+    const account = await requireAccount();
+    const setup = publicSetupAccess(await getSetupDetails(db(), account));
+    return p === "auth/me" ? { user: account.user, setup } : setup;
   }
+
+  if (p === "auth/setup" && method === "POST") {
+    const account = await requireAccount();
+    return completeRestaurantSetup(db(), account, body);
+  }
+
+  // The same membership and completion checks protect all POS API calls,
+  // not just the client-side shell or a potentially cached Next layout.
+  const user = await requireReadyUser();
 
   if (p.startsWith("auth/2fa") && method === "GET") {
     return { enabled: false, recoveryCodesLeft: 0 };
@@ -179,8 +169,6 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
   if (p.startsWith("auth/2fa") && method === "POST") {
     throw new HttpError(501, "TOTP 2FA is not available on the Firebase/Vercel deployment yet");
   }
-
-  const user = await requireUser();
 
   if (p === "branches" && method === "GET") {
     const snap = await db().collection("branches").where("restaurantId", "==", user.restaurantId).get();
@@ -197,7 +185,9 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
 
   if (p === "settings/restaurant" && method === "PATCH") {
     requirePermission(user, "settings.manage");
-    await db().collection("restaurants").doc(user.restaurantId).set(body as object, { merge: true });
+    // Do not allow settings edits to write setupComplete, ownerUid or tenant IDs.
+    const changes = restaurantSettingsSchema.parse(body);
+    await db().collection("restaurants").doc(user.restaurantId).set(changes, { merge: true });
     const snap = await db().collection("restaurants").doc(user.restaurantId).get();
     return { id: snap.id, ...snap.data() };
   }
@@ -215,7 +205,8 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
     requirePermission(user, "settings.manage");
     const branchId = requireBranchId(url);
     await assertBranch(user, branchId);
-    await db().collection("branches").doc(branchId).set(body as object, { merge: true });
+    const changes = branchSettingsSchema.parse(body);
+    await db().collection("branches").doc(branchId).set(changes, { merge: true });
     const snap = await db().collection("branches").doc(branchId).get();
     return { id: snap.id, ...snap.data() };
   }
@@ -235,10 +226,11 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
     const file = ctx.form?.get("file");
     if (!(file instanceof File)) throw new HttpError(400, "No file uploaded");
     const branchId = url.searchParams.get("branchId") ?? "";
+    if (branchId) await assertBranch(user, branchId);
     return uploadToImgbb(file, { kind: "menu", restaurantId: user.restaurantId, branchId });
   }
 
-  const branchCrud = matchBranchCrud(p, method);
+  const branchCrud = matchBranchCrud(p);
   if (branchCrud) {
     const branchId = requireBranchId(url);
     await assertBranch(user, branchId);
@@ -290,6 +282,7 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
   }
 
   if (p === "dashboard/summary" && method === "GET") {
+    requirePermission(user, "dashboard.sales.view");
     const branchId = requireBranchId(url);
     await assertBranch(user, branchId);
     const ordersSnap = await listByBranch("orders", user.restaurantId, branchId);
@@ -302,6 +295,7 @@ export async function handleApi(ctx: Ctx): Promise<unknown> {
     };
   }
   if (p === "dashboard/trends" && method === "GET") {
+    requirePermission(user, "dashboard.sales.view");
     return { points: [] };
   }
 
@@ -365,7 +359,7 @@ function filterSearch(rows: Record<string, unknown>[], url: URL) {
   return rows.filter((r) => JSON.stringify(r).toLowerCase().includes(q));
 }
 
-function matchBranchCrud(p: string, _method: string) {
+function matchBranchCrud(p: string) {
   const map: { prefix: string; col: string; perm: string }[] = [
     { prefix: "customers", col: "customers", perm: "customers.manage" },
     { prefix: "reservations", col: "reservations", perm: "reservations.manage" },
@@ -454,7 +448,8 @@ async function menuItems(user: SessionUser, url: URL, method: string, p: string,
   if (method === "POST" && !id) {
     requirePermission(user, "menu.manage");
     const dto = body as Record<string, unknown>;
-    const { modifierGroupIds: _m, ...rest } = dto;
+    const rest = { ...dto };
+    delete rest.modifierGroupIds;
     return createOwned("menuItems", user, branchId, rest);
   }
   if (method === "PATCH" && id) {
@@ -582,8 +577,13 @@ async function orders(
       type?: string;
     };
     if (dto.requestId) {
-      const dup = await db().collection("orders").where("requestId", "==", dto.requestId).limit(1).get();
-      if (dup.docs.length) return { id: dup.docs[0].id, ...dup.docs[0].data() };
+      const matches = await db().collection("orders").where("requestId", "==", dto.requestId).get();
+      const dup = matches.docs.find((doc) => belongsToBranch(user, branchId, doc.data()));
+      if (dup) return { ...dup.data(), id: dup.id };
+    }
+    if (dto.tableId) {
+      const table = await getOwned("tables", dto.tableId, user);
+      if (table.branchId !== branchId) throw new HttpError(403, "Table belongs to another branch");
     }
     const menu = await listByBranch("menuItems", user.restaurantId, branchId);
     const byId = new Map(menu.map((m) => [m.id, m]));
@@ -751,6 +751,10 @@ async function orders(
         changeGiven: x.changeGiven != null ? String(x.changeGiven) : null,
       })),
     ];
+    if (settlement.fullyPaid && order.tableId) {
+      const table = await getOwned("tables", String(order.tableId), user);
+      if (table.branchId !== branchId) throw new HttpError(403, "Table belongs to another branch");
+    }
     const status = settlement.fullyPaid ? "PAID" : "OPEN";
     const next = {
       ...order,

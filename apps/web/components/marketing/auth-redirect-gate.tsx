@@ -4,17 +4,16 @@ import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { useCurrentUser } from "@/hooks/use-auth";
 
-// A returning, already-logged-in visitor hitting "/" should land on their
-// dashboard, not the marketing page — this is the one client-side redirect
-// this page needs; everything else renders immediately for a logged-out
-// visitor (the common case for a marketing homepage).
+// Optional gate for a page that wants to send signed-in users into the app.
+// The root makes the server-side setup decision; /about deliberately does not
+// use this gate so the public product page stays accessible to everyone.
 export function AuthRedirectGate() {
   const { data, isSuccess } = useCurrentUser();
   const router = useRouter();
 
   useEffect(() => {
     if (isSuccess && data?.user) {
-      router.replace("/dashboard");
+      router.replace("/");
     }
   }, [isSuccess, data, router]);
 

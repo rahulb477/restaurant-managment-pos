@@ -2,15 +2,14 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import type { SetupAccess } from "@/lib/onboarding";
 
-// Public, unauthenticated — whether any restaurant has been registered on
-// this self-hosted instance yet. Drives whether "/" shows the full
-// marketing pitch (unclaimed install) or just Sign in + View documentation
-// (someone already completed setup — see MarketingHomePage).
+// The authenticated account's own membership and setup state, not a global
+// check for whether some other restaurant exists.
 export function useSetupStatus() {
   return useQuery({
     queryKey: ["auth", "setup-status"],
-    queryFn: () => api.get<{ isSetup: boolean }>("/auth/setup-status"),
+    queryFn: () => api.get<SetupAccess>("/auth/setup-status"),
     staleTime: 60_000,
   });
 }

@@ -20,9 +20,11 @@ async function run(req: Request, ctx: { params: Promise<{ path: string[] }> }) {
       }
     }
     const data = await handleApi({ method, parts: path ?? [], url, body, form });
-    return json(data ?? { ok: true });
+    return json(data ?? { ok: true }, 200, { "Cache-Control": "private, no-store" });
   } catch (err) {
-    return errorResponse(err);
+    const response = errorResponse(err);
+    response.headers.set("Cache-Control", "private, no-store");
+    return response;
   }
 }
 
