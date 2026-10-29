@@ -4,7 +4,6 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { loginSchema, type LoginDto } from "@nodedr-restaurant/types";
 import { motion, useReducedMotion } from "motion/react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { AlertCircle } from "lucide-react";
@@ -17,7 +16,6 @@ import { useLogin, usePasswordReset } from "@/hooks/use-auth";
 import { ApiError } from "@/lib/api";
 
 export default function LoginPage() {
-  const router = useRouter();
   const login = useLogin();
   const passwordReset = usePasswordReset();
   // Set once the server says this account uses two-factor authentication.
@@ -34,7 +32,7 @@ export default function LoginPage() {
   const onSubmit = (dto: LoginDto) => {
     setError(null);
     login.mutate(dto, {
-      onSuccess: () => router.push("/dashboard"),
+      onSuccess: () => window.location.replace("/"),
       onError: (err) => {
         if (err instanceof ApiError && err.message === "TWO_FACTOR_REQUIRED") {
           setNeedsCode(true);
@@ -166,6 +164,9 @@ export default function LoginPage() {
           <Link href="/signup" className="font-medium text-foreground hover:underline">
             Create an account
           </Link>
+        </p>
+        <p className="mt-3 text-center text-xs text-muted-foreground">
+          <Link href="/about" className="hover:underline">About OrderRestro</Link>
         </p>
       </motion.div>
     </main>

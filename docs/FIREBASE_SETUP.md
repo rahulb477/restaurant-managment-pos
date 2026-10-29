@@ -24,12 +24,13 @@ Do not invent project IDs or API keys. Create them in the Firebase console.
 ## 4. Service account (Admin SDK, server only)
 
 1. Project settings → Service accounts → Generate new private key.
-2. Set on the **Nest** process only:
+2. Set on the **Next.js server** for Vercel (or on Nest for the legacy deployment), never in browser code:
 
 ```
 FIREBASE_PROJECT_ID=
 FIREBASE_CLIENT_EMAIL=
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+FIREBASE_WEB_API_KEY=  # Firebase Web API key used by the server for email/password sign-in
 ```
 
 Never put the private key in `NEXT_PUBLIC_*`, Git, or browser bundles.
@@ -45,7 +46,7 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=
 NEXT_PUBLIC_FIREBASE_APP_ID=
 ```
 
-These identify the project; **authorization is Auth + rules + Nest**.
+These identify the project; **authorization is Firebase Auth, rules, and the trusted server (Next.js or legacy Nest)**.
 
 ## 6. Application flags
 
@@ -57,7 +58,7 @@ DATA_STORE=postgres        # default
 # DATA_STORE=firestore     # read/write tenant data via Admin SDK
 ```
 
-On Vercel, set Auth to Email/Password and paste Admin credentials into the Next.js project. NestJS is not required for production. The API returns 503 until Admin env vars exist.
+On Vercel, enable Email/Password and set the Admin credentials and `FIREBASE_WEB_API_KEY` on the Next.js server. NestJS is not required for this deployment. Login/signup and session verification return 503 until Admin env vars exist. Set `COOKIE_SECURE=true` for HTTPS.
 
 ## 7. Session cookies
 
@@ -69,5 +70,6 @@ When `AUTH_PROVIDER=firebase`, Nest calls `createSessionCookie` and still sets h
 - Enable Email/Password.
 - Create Firestore.
 - Deploy `firestore.rules`.
-- Paste service account env vars on the server.
+- Paste service account env vars and `FIREBASE_WEB_API_KEY` on the server, and set `COOKIE_SECURE=true` when using HTTPS.
+- Follow the onboarding and legacy UID-mapping guidance in `docs/VERCEL_DEPLOYMENT.md`; verify with real Firebase before deploying to production.
 - Paste public web config in `.env` for the Next app if client Auth is used.

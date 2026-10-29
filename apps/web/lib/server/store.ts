@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { db } from "./firebase";
 import { HttpError } from "./http";
 import type { SessionUser } from "@nodedr-restaurant/types";
-import { assertRestaurant } from "./session";
+import { assertRestaurant, tenantSafeChanges } from "./tenant";
 
 export type DocRow = Record<string, unknown> & { id: string };
 
@@ -13,7 +13,7 @@ export async function listByBranch(
 ): Promise<DocRow[]> {
   const snap = await db().collection(collection).where("branchId", "==", branchId).get();
   return snap.docs
-    .map((d) => ({ id: d.id, ...d.data() }))
+    .map((d) => ({ ...d.data(), id: d.id }))
     .filter((row) => (row as { restaurantId?: string }).restaurantId === restaurantId);
 }
 
@@ -26,7 +26,7 @@ export async function getOwned(
   if (!snap.exists) throw new HttpError(404, "Not found");
   const data = snap.data() ?? {};
   assertRestaurant(user, String(data.restaurantId ?? ""));
-  return { id: snap.id, ...data };
+  return { ...data, id: snap.id };
 }
 
 export async function createOwned(
@@ -38,14 +38,14 @@ export async function createOwned(
 ) {
   const docId = id ?? randomUUID();
   const payload = {
-    ...data,
+    ...tenantSafeChanges(data),
     restaurantId: user.restaurantId,
     ...(branchId ? { branchId } : {}),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   await db().collection(collection).doc(docId).set(payload);
-  return { id: docId, ...payload };
+  return { ...payload, id: docId };
 }
 
 export async function patchOwned(
@@ -55,7 +55,9 @@ export async function patchOwned(
   data: Record<string, unknown>,
 ) {
   const current = await getOwned(collection, id, user);
-  const next = { ...current, ...data, updatedAt: new Date().toISOString() };
+  // Identity and tenant/branch ownership are server-controlled, including
+  // for generic CRUD handlers that otherwise accept flexible payloads.
+  const next = { ...current, ...tenantSafeChanges(data), updatedAt: new Date().toISOString() };
   await db().collection(collection).doc(id).set(next, { merge: true });
   return next;
 }
@@ -71,5 +73,5 @@ export async function assertBranch(user: SessionUser, branchId: string) {
   if (!snap.exists) throw new HttpError(404, "Branch not found");
   const data = snap.data() ?? {};
   assertRestaurant(user, String(data.restaurantId ?? ""));
-  return { id: snap.id, ...data };
+  return { ...data, id: snap.id };
 }
