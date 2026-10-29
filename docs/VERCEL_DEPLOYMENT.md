@@ -1,24 +1,16 @@
 # Vercel deployment
 
-The production app is **only** `apps/web` (Next.js App Router). It serves the UI and `/api/v1/*` route handlers. It does **not** start NestJS, PostgreSQL, Prisma, Socket.IO, or write durable files to local disk.
+The current production request path is `apps/web` (Next.js App Router). It serves the UI and `/api/v1/*` route handlers. Those handlers implement the app's Firebase-backed API; they do **not** proxy to NestJS. The web runtime does **not** start NestJS, PostgreSQL, Prisma, Socket.IO, or write durable files to local disk.
+
+The repository-root `vercel.json` declares `web` and `backend` as Vercel services. Only `web` is publicly routed (all paths); `backend` is internal and receives no public traffic. This is deliberately conservative: routing `/api/*` to Nest would shadow the existing Next `/api/v1/*` handlers, and the current web code has no fixed call to the Nest service. No service binding is therefore configured. The Nest service's compatibility with Vercel's runtime and its external dependencies still need deployment validation before making it public or wiring it to the web service.
 
 Do not deploy until Firebase Admin, Firestore rules, and ImgBB are configured. This document does not claim a live deploy succeeded.
 
-## Vercel project settings
+## Service build configuration
 
-| Setting | Value |
-|---|---|
-| Framework | Next.js |
-| Node.js | **22.x** |
-| Root Directory | **repository root** (pnpm workspace) |
-| Install Command | `pnpm install` |
-| Build Command | `pnpm --filter @nodedr-restaurant/types build && pnpm --filter web build` |
-| Output | Next default (`apps/web/.next`) |
-| Ignored build step | leave empty |
+The service roots and frameworks are declared in `vercel.json`: `apps/backend` (NestJS) and `apps/web` (Next.js). The repository uses a shared pnpm workspace and lockfile. Keep build/install settings scoped to the service that needs them; services mode does not allow those build/runtime settings at the top level. The repository's Node engine requirement is **22.x**.
 
-If Root Directory is set to `apps/web` instead, Vercel must still see the workspace (`pnpm-workspace.yaml` one level up). Prefer **root**.
-
-Do **not** set `BACKEND_URL`. `next.config.ts` has **no** rewrite to Nest.
+Do **not** set `BACKEND_URL`. The web app's `next.config.ts` has no rewrite to Nest, and no application code currently calls a fixed internal backend URL.
 
 ## Environment variables
 
