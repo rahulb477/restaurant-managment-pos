@@ -10,13 +10,18 @@ import {
   type RestaurantSettingsDto,
 } from '@nodedr-restaurant/types';
 import { AuditService } from '../../audit/audit.service';
+import { domainOnFirestore } from '../../firebase/domain-flags';
+import { FirebaseFirestoreService } from '../../firebase/firebase-firestore.service';
 import { PrismaService } from '../../prisma/prisma.service';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class SettingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly firestore: FirebaseFirestoreService,
+    private readonly config: ConfigService,
   ) {}
 
   async get(restaurantId: string, branchId: string) {
@@ -48,6 +53,13 @@ export class SettingsService {
       entityId: restaurantId,
       metadata: { changes: dto },
     });
+    if (domainOnFirestore('settings', this.config.get<string>('FIRESTORE_DOMAINS'))) {
+      await this.firestore.writeRestaurant(restaurantId, {
+        name: updated.name,
+        logoUrl: updated.logoUrl,
+        currency: updated.currency,
+      });
+    }
     return updated;
   }
 

@@ -26,6 +26,7 @@ import {
   assertValidImageSignature,
   imageUploadOptions,
 } from '../../common/upload/image-upload.config';
+import { ImgbbService } from '../../common/upload/imgbb.service';
 import { SettingsService } from './settings.service';
 
 @ApiTags('settings')
@@ -34,6 +35,7 @@ export class SettingsController {
   constructor(
     private readonly settingsService: SettingsService,
     private readonly branchAccess: BranchAccessService,
+    private readonly imgbb: ImgbbService,
   ) {}
 
   @Auth('settings.manage')
@@ -63,15 +65,21 @@ export class SettingsController {
   @Auth('settings.manage')
   @Post('restaurant/logo')
   @UseInterceptors(FileInterceptor('file', imageUploadOptions))
-  uploadRestaurantLogo(@UploadedFile() file?: Express.Multer.File) {
+  async uploadRestaurantLogo(
+    @CurrentUser() user: SessionUser,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
     if (!file) {
       throw new BadRequestException('No file uploaded');
     }
-    // See menu.controller.ts's uploadItemImage — same rationale for
-    // checking the bytes on disk before this URL is saved and served back
-    // publicly as the restaurant's branding.
     assertValidImageSignature(file.path);
-    return { url: `/api/uploads/${file.filename}` };
+    return this.imgbb.uploadPublicImage({
+      filePath: file.path,
+      filename: file.filename,
+      restaurantId: user.restaurantId,
+      kind: 'logo',
+      localUrl: `/api/uploads/${file.filename}`,
+    });
   }
 
   @Auth('settings.manage')

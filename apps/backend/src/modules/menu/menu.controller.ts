@@ -29,6 +29,7 @@ import {
   assertValidImageSignature,
   imageUploadOptions,
 } from '../../common/upload/image-upload.config';
+import { ImgbbService } from '../../common/upload/imgbb.service';
 import { MenuService } from './menu.service';
 
 @ApiTags('menu')
@@ -37,6 +38,7 @@ export class MenuController {
   constructor(
     private readonly menuService: MenuService,
     private readonly branchAccess: BranchAccessService,
+    private readonly imgbb: ImgbbService,
   ) {}
 
   // --- Categories ---------------------------------------------------------
@@ -152,16 +154,27 @@ export class MenuController {
   @Auth('menu.manage')
   @Post('items/upload-image')
   @UseInterceptors(FileInterceptor('file', imageUploadOptions))
-  uploadItemImage(@UploadedFile() file?: Express.Multer.File) {
+  async uploadItemImage(
+    @CurrentUser() user: SessionUser,
+    @Query('branchId') branchId: string,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
     if (!file) {
       throw new BadRequestException('No file uploaded');
     }
-    // fileFilter (imageUploadOptions) only saw the client-declared
-    // filename/mimetype before any bytes were read — verify the bytes
-    // actually on disk match a real image signature before this URL is
-    // ever handed back to be saved on a menu item and served publicly.
+    if (!branchId) {
+      throw new BadRequestException('branchId is required');
+    }
+    await this.branchAccess.assertAccess(user.restaurantId, branchId);
     assertValidImageSignature(file.path);
-    return { url: `/api/uploads/${file.filename}` };
+    return this.imgbb.uploadPublicImage({
+      filePath: file.path,
+      filename: file.filename,
+      restaurantId: user.restaurantId,
+      branchId,
+      kind: 'menu',
+      localUrl: `/api/uploads/${file.filename}`,
+    });
   }
 
   @Auth('menu.manage')

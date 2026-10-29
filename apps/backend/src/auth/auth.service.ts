@@ -14,6 +14,8 @@ import {
   type SessionUser,
 } from '@nodedr-restaurant/types';
 import * as bcrypt from 'bcrypt';
+import { FirebaseAuthService } from '../firebase/firebase-auth.service';
+import { FirebaseFirestoreService } from '../firebase/firebase-firestore.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwoFactorService } from './two-factor.service';
 
@@ -23,6 +25,8 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly twoFactor: TwoFactorService,
+    private readonly firebaseAuth: FirebaseAuthService,
+    private readonly firestore: FirebaseFirestoreService,
   ) {}
 
   private toSessionUser(user: {
@@ -65,7 +69,7 @@ export class AuthService {
       await this.twoFactor.verifyLogin(user, dto.totp);
     }
 
-    return this.issueSession(user);
+    return this.issueSession(user, dto.password);
   }
 
   async register(dto: RegisterDto) {
@@ -143,7 +147,33 @@ export class AuthService {
       return user;
     });
 
-    return this.issueSession(owner);
+    const firebaseUid = await this.firebaseAuth.createFirebaseUser(
+      dto.email,
+      dto.password,
+      dto.ownerName,
+    );
+    await this.firestore.writeRestaurant(owner.restaurantId, {
+      name: dto.restaurantName,
+    });
+    await this.firestore.writeUser(owner.id, {
+      restaurantId: owner.restaurantId,
+      email: dto.email,
+      name: dto.ownerName,
+      roleName: 'OWNER',
+      isActive: true,
+      firebaseUid: firebaseUid ?? null,
+    });
+
+    return this.issueSession(owner, dto.password);
+  }
+
+  async requestPasswordReset(email: string) {
+    // Always 204-shaped success to the controller so we do not reveal
+    // whether the email exists. Firebase generates the reset link when configured.
+    const user = await this.prisma.user.findFirst({ where: { email } });
+    if (!user) return { ok: true };
+    await this.firebaseAuth.passwordResetLink(email);
+    return { ok: true };
   }
 
   async hasAnyRestaurant(): Promise<boolean> {
@@ -181,8 +211,20 @@ export class AuthService {
 
   private async issueSession(
     user: Parameters<AuthService['toSessionUser']>[0],
+    password?: string,
   ) {
     const sessionUser = this.toSessionUser(user);
+    if (this.firebaseAuth.isFirebaseAuth() && password) {
+      const idToken = await this.firebaseAuth.signInWithPassword(
+        (user as { email?: string }).email ?? '',
+        password,
+      );
+      if (idToken) {
+        const cookie = await this.firebaseAuth.sessionCookieFromIdToken(idToken);
+        return { token: cookie, user: sessionUser };
+      }
+      throw new UnauthorizedException('Firebase sign-in failed');
+    }
     const token = await this.jwt.signAsync({ sub: user.id });
     return { token, user: sessionUser };
   }

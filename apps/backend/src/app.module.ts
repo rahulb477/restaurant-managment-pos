@@ -3,11 +3,14 @@ import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_FILTER, APP_GUARD } from '@nestjs/core';
+import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { PrismaExceptionFilter } from './common/filters/prisma-exception.filter';
 import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { FirebaseModule } from './firebase/firebase.module';
+import { UploadModule } from './common/upload/upload.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { MenuModule } from './modules/menu/menu.module';
 import { AttendanceModule } from './modules/attendance/attendance.module';
@@ -50,6 +53,8 @@ import { VerifactuModule } from './modules/verifactu/verifactu.module';
     ScheduleModule.forRoot(),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 300 }]),
     PrismaModule,
+    FirebaseModule,
+    UploadModule,
     RealtimeModule,
     AuthModule,
     MenuModule,
@@ -89,6 +94,7 @@ import { VerifactuModule } from './modules/verifactu/verifactu.module';
   ],
   controllers: [AppController],
   providers: [
+    JwtAuthGuard,
     AppService,
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_FILTER, useClass: PrismaExceptionFilter },

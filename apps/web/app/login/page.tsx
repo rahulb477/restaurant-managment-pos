@@ -13,12 +13,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PasswordInput } from "@/components/ui/password-input";
 import { Label } from "@/components/ui/label";
-import { useLogin } from "@/hooks/use-auth";
+import { useLogin, usePasswordReset } from "@/hooks/use-auth";
 import { ApiError } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
   const login = useLogin();
+  const passwordReset = usePasswordReset();
   // Set once the server says this account uses two-factor authentication.
   const [needsCode, setNeedsCode] = useState(false);
   // Shown inline under the form (a toast vanishes before it can be read).
@@ -141,6 +142,23 @@ export default function LoginPage() {
           <Button type="submit" className="mt-2 h-12 text-base" disabled={login.isPending}>
             {login.isPending ? "Signing in…" : "Sign in"}
           </Button>
+          <button
+            type="button"
+            className="text-xs text-muted-foreground hover:underline"
+            onClick={() => {
+              const email = (document.getElementById("email") as HTMLInputElement | null)?.value;
+              if (!email) {
+                setError("Enter your email first, then request a reset.");
+                return;
+              }
+              passwordReset.mutate(email, {
+                onSuccess: () => setError(null),
+                onError: () => setError("Could not request a password reset."),
+              });
+            }}
+          >
+            {passwordReset.isPending ? "Sending reset…" : passwordReset.isSuccess ? "Reset email requested" : "Forgot password?"}
+          </button>
         </form>
 
         <p className="mt-8 text-center text-xs text-muted-foreground">

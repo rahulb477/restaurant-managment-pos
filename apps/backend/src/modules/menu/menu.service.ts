@@ -9,6 +9,7 @@ import type {
   ModifierGroupDto,
 } from '@nodedr-restaurant/types';
 import { AuditService } from '../../audit/audit.service';
+import { FirestoreMenuRepository } from '../../firebase/firestore-menu.repository';
 import { PrismaService } from '../../prisma/prisma.service';
 
 @Injectable()
@@ -16,7 +17,16 @@ export class MenuService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    private readonly firestoreMenu: FirestoreMenuRepository,
   ) {}
+
+  private async restaurantIdForBranch(branchId: string): Promise<string> {
+    const branch = await this.prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { restaurantId: true },
+    });
+    return branch?.restaurantId ?? '';
+  }
 
   // --- Categories ---------------------------------------------------------
 
@@ -28,8 +38,16 @@ export class MenuService {
     });
   }
 
-  createCategory(branchId: string, dto: MenuCategoryDto) {
-    return this.prisma.menuCategory.create({ data: { ...dto, branchId } });
+  async createCategory(branchId: string, dto: MenuCategoryDto) {
+    const row = await this.prisma.menuCategory.create({ data: { ...dto, branchId } });
+    const restaurantId = await this.restaurantIdForBranch(branchId);
+    await this.firestoreMenu.mirrorCategory({
+      id: row.id,
+      restaurantId,
+      branchId,
+      data: { name: row.name, sortOrder: row.sortOrder },
+    });
+    return row;
   }
 
   async updateCategory(
@@ -98,7 +116,7 @@ export class MenuService {
   async createItem(branchId: string, dto: MenuItemDto) {
     const { modifierGroupIds, ...rest } = dto;
     await this.assertModifierGroupsInBranch(branchId, modifierGroupIds);
-    return this.prisma.menuItem.create({
+    const item = await this.prisma.menuItem.create({
       data: {
         ...rest,
         branchId,
@@ -111,6 +129,14 @@ export class MenuService {
       },
       include: { modifierGroups: { include: { modifierGroup: true } } },
     });
+    const restaurantId = await this.restaurantIdForBranch(branchId);
+    await this.firestoreMenu.mirrorItem({
+      id: item.id,
+      restaurantId,
+      branchId,
+      data: { name: item.name, price: String(item.price), isAvailable: item.isAvailable },
+    });
+    return item;
   }
 
   async updateItem(
