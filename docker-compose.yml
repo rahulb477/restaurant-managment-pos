@@ -1,0 +1,140 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nodedr-restaurant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nodedr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nodedr_dev_pw}
+      POSTGRES_DB: nodedr_restaurant
+    # Not published to the host — only the backend needs it, over the
+    # internal Docker network. Uncomment `ports` below for local psql access.
+    expose:
+      - "5432"
+    # ports:
+    #   - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nodedr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+      args:
+        APP_VERSION: "${APP_VERSION:-dev}"
+    # Same name CI publishes. `up --build` tags the local build with it, and
+    # the in-app "Update now" button (see the `updater` service below) pulls
+    # the published image of a newer version under it.
+    image: ghcr.io/raktim94/nodedr-restaurant-pos-backend:${APP_VERSION:-dev}
+    container_name: nodedr-restaurant-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql://nodedr:${POSTGRES_PASSWORD:-nodedr_dev_pw}@postgres:5432/nodedr_restaurant"
+      JWT_SECRET: ${JWT_SECRET:?set a real JWT_SECRET in .env for anything beyond local dev}
+      JWT_EXPIRES_IN: "12h"
+      PORT: "4000"
+      CORS_ORIGIN: "${FRONTEND_ORIGIN:-http://localhost:1995}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      UPLOADS_DIR: "/data/uploads"
+      # Spain VERI*FACTU (Settings > VERI*FACTU). The producer identifier is a legal fact only the software
+      # producer can supply; leave it unset and the branch reports exactly what is missing. See docs/verifactu.md.
+      VERIFACTU_PRODUCER_ID: "${VERIFACTU_PRODUCER_ID:-}"
+      VERIFACTU_PRODUCER_NAME: "${VERIFACTU_PRODUCER_NAME:-}"
+      VERIFACTU_PRODUCER_COUNTRY: "${VERIFACTU_PRODUCER_COUNTRY:-}"
+      VERIFACTU_SYSTEM_ID: "${VERIFACTU_SYSTEM_ID:-}"
+      SYNC_API_KEY: "${SYNC_API_KEY:-}"
+      # In-app updates (Settings > Updates): the backend asks the `updater`
+      # container below to pull the latest published images. Unset these two
+      # and the Update button simply says this install can't update itself.
+      UPDATER_URL: "http://updater:8080"
+      UPDATER_TOKEN: "${UPDATER_TOKEN:-nodedr-restaurant-updater}"
+      # Optional: S3 backup config can also be set from Settings > Backup
+      # (persisted to the `backup_config` DB row, which takes priority over
+      # these). Uncomment for a headless/CasaOS-style deployment that
+      # configures backups purely from env vars instead.
+      # S3_BACKUP_ENDPOINT: "https://s3.example.com"
+      # S3_BACKUP_BUCKET: "orderrestro-backups"
+      # S3_BACKUP_ACCESS_KEY_ID: ""
+      # S3_BACKUP_SECRET_ACCESS_KEY: ""
+      # S3_BACKUP_REGION: "auto"
+      # S3_BACKUP_INTERVAL_DAYS: "3"
+      # S3_BACKUP_RETAIN_COUNT: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Not published to the host — reachable only via the web service's
+    # server-side /api proxy, same reasoning as nodedr-pos (keeps the API
+    # off the LAN, shrinks attack surface).
+    expose:
+      - "4000"
+    volumes:
+      - uploads_data:/data/uploads
+      # Direct-USB thermal printing (see apps/backend/src/modules/orders/
+      # escpos-usb.ts, ported from nodedr-pos's real hardware-verified
+      # transport) needs the backend to see the host's USB device nodes.
+      # Bind-mounting the whole /dev/bus/usb tree (not `devices:` with a
+      # literal path, which only handles nodes that exist at container
+      # start — USB bus/device numbers are dynamic and can renumber on
+      # reconnect) keeps this working across printer unplug/replug without
+      # a restart.
+      - /dev/bus/usb:/dev/bus/usb
+    # Grants read/write/mknod WITHOUT full `privileged: true` on the two
+    # device majors the printer needs, so the backend still can't see or
+    # touch anything else on the host:
+    #   189 — usbfs (/dev/bus/usb/BBB/DDD), used by the libusb transport.
+    #   180 — usblp, the kernel printer driver behind /dev/usb/lp0 — the
+    #         PRIMARY transport (see escpos-usb.ts): the same node a
+    #         working `echo > /dev/usb/lp0` writes to, and the one generic
+    #         vendor-class 80mm printers only expose through the kernel.
+    #         The 'm' (mknod) grant lets the backend create the lp node
+    #         inside the container on demand and write straight through to
+    #         the host kernel's already-bound printer — no host bind mount,
+    #         so nothing fails at `compose up` when no printer is attached.
+    device_cgroup_rules:
+      - 'c 189:* rmw'
+      - 'c 180:* rmw'
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Next bakes rewrite destinations at BUILD time — this must be a
+        # build ARG, not a runtime env (see apps/web/Dockerfile comment).
+        BACKEND_URL: "http://backend:4000"
+    image: ghcr.io/raktim94/nodedr-restaurant-pos-web:${APP_VERSION:-dev}
+    container_name: nodedr-restaurant-web
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-1995}:3000"
+    depends_on:
+      - backend
+
+  # One-click updates. A tiny sidecar (see updater/server.js) that does
+  # NOTHING on its own — no polling, no auto-update. When an admin presses
+  # Settings > Updates > "Update now", the backend tells it which published
+  # version to move to; it pulls that exact version of the backend and web
+  # images and recreates those two containers with the same settings (data
+  # volumes untouched, rolled back if it fails). It needs the Docker socket,
+  # which is why it is its own container on the internal network (no
+  # published port) instead of privilege handed to the app backend.
+  updater:
+    build:
+      context: ./updater
+    image: ghcr.io/raktim94/nodedr-restaurant-pos-updater:latest
+    container_name: nodedr-restaurant-updater
+    restart: unless-stopped
+    environment:
+      UPDATER_TOKEN: "${UPDATER_TOKEN:-nodedr-restaurant-updater}"
+      TARGET_CONTAINERS: "nodedr-restaurant-backend,nodedr-restaurant-web"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  pg_data:
+  uploads_data:

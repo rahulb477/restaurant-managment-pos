@@ -1,0 +1,179 @@
+name: Publish Docker images
+
+# Builds and publishes the backend/web images that the CasaOS/ZimaOS app
+# store manifest (casaos/docker-compose.yml) pulls as pre-built,
+# version-pinned images. CasaOS installs an app straight from its compose
+# file with no build step and no access to this repo's source, so `build:`
+# (used in the repo-root docker-compose.yml for a `git clone` + build flow)
+# is not an option there — the CasaOS manifest instead references
+# `ghcr.io/raktim94/nodedr-restaurant-pos-{backend,web}:<version>`, and
+# those tags only exist because this workflow pushed them.
+#
+# Each architecture is built on a NATIVE runner (ubuntu-24.04-arm for arm64)
+# and the two digests are merged into one multi-arch tag afterwards. The old
+# single-job QEMU build emulated arm64 and ran the Next.js build ~10x slower,
+# which pushed the web image past the 60 minute job limit and got the run
+# cancelled.
+#
+# Multi-arch (amd64 + arm64) on purpose: a real share of CasaOS/ZimaOS boxes
+# are ARM SBCs, and declaring `architectures: [amd64, arm64]` in the
+# x-casaos manifest without actually publishing an arm64 image would install
+# a broken app on that hardware. Pushed to GHCR (same registry as sibling
+# project nodedr-pos) using the automatic `secrets.GITHUB_TOKEN` — no
+# manually-created registry credential needed.
+
+# A push to master publishes only :edge and :sha-<commit>, so unreleased code can never replace the image a
+# version tag (and every install pinned to it) points at. A version tag (vX.Y.Z) or a manual run with a
+# version publishes :<version> and :latest.
+on:
+  push:
+    tags: ["v*"]
+    branches: [master]
+    paths:
+      - "apps/backend/**"
+      - "apps/web/**"
+      - "packages/types/**"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish (e.g. 1.0.0). Also pushed as :latest. Leave empty to publish :edge only."
+        required: false
+        default: ""
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      owner: ${{ steps.version.outputs.owner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Shallow clones carry no tags, so `git describe` would silently
+          # return nothing. fetch-depth: 0 pulls history + tags.
+          fetch-depth: 0
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          # No version: a plain push to master. Build and publish :edge only.
+          if [ -z "$VERSION" ]; then
+            VERSION="edge"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # GHCR image paths must be lowercase.
+          echo "owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [nodedr-restaurant-pos-backend, nodedr-restaurant-pos-web]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - image: nodedr-restaurant-pos-backend
+            dockerfile: apps/backend/Dockerfile
+          - image: nodedr-restaurant-pos-web
+            dockerfile: apps/web/Dockerfile
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # web needs the backend URL baked in at build time (Next.js rewrites
+          # resolve at build). APP_VERSION is only used by the backend image.
+          build-args: |
+            BACKEND_URL=http://backend:4000
+            APP_VERSION=${{ needs.version.outputs.version }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.slug }}
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        image: [nodedr-restaurant-pos-backend, nodedr-restaurant-pos-web]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/${{ matrix.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if [ "$VERSION" = "edge" ]; then
+            TAGS="-t $IMAGE:edge -t $IMAGE:sha-${GITHUB_SHA::7}"
+          else
+            TAGS="-t $IMAGE:$VERSION -t $IMAGE:latest"
+          fi
+          docker buildx imagetools create $TAGS \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Inspect
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/${{ matrix.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"

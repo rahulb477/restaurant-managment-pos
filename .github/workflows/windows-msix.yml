@@ -1,0 +1,531 @@
+name: Windows MSIX build
+
+# Real build/package/install verification for the OrderRestro Windows
+# client, run on an actual windows-latest runner since no Windows machine
+# is available in local development. This is the authoritative PASS/FAIL
+# signal for "does the MSIX build and install" — see windows/msix/README.md
+# for what this does and does not prove (no physical hardware, no printer,
+# no Start Menu/UAC-prompt visual check — those need a human on real
+# hardware).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-msix.yml'
+  pull_request:
+    paths:
+      - 'windows/**'
+  workflow_dispatch: {}
+
+jobs:
+  build-and-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      # windows-latest ships the Windows 10/11 SDK (part of the VS Build
+      # Tools workload) but makeappx.exe/signtool.exe aren't on PATH by
+      # default outside a "Developer PowerShell for VS" prompt — locate the
+      # highest-versioned x64 SDK bin directory and add it for the rest of
+      # this job.
+      - name: Add Windows SDK tools (makeappx, signtool) to PATH
+        shell: pwsh
+        run: |
+          # Not every "…\bin\<version>\x64" directory actually contains
+          # makeappx.exe (some SDK component subsets on hosted runners omit
+          # it) — search for the tool itself rather than assuming the
+          # highest-versioned directory has it.
+          $makeappx = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) {
+            Write-Host "Windows Kits 10 bin dirs found:"
+            Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "  $($_.FullName): $((Get-ChildItem $_.FullName -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty Name) -join ', ')"
+            }
+            throw "makeappx.exe not found under any Windows 10/11 SDK bin directory"
+          }
+          $sdkBinDir = Split-Path $makeappx.FullName -Parent
+          Write-Host "Using SDK tools from: $sdkBinDir"
+          Add-Content -Path $env:GITHUB_PATH -Value $sdkBinDir
+
+      - name: Build + package (self-signed test cert)
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          ./build-windows-msix.ps1 -Configuration Release -SelfSignedTest
+
+      - name: Validate package structure
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          # No -AllowPlaceholderPublisher needed: AppxManifest.xml now
+          # carries the real Partner Center publisher identity, and
+          # build-windows-msix.ps1's -SelfSignedTest cert subject tracks
+          # that same value — so the default (strict) placeholder check
+          # is the real, meaningful signal here, not a false failure.
+          ./validate-msix.ps1 -MsixPath ./out/OrderRestro.msix
+
+      - name: Install + verify Start Menu registration
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          Add-AppxPackage -Path ./out/OrderRestro.msix -ErrorAction Stop
+          # Read the identity Name from the manifest rather than hardcoding
+          # it a second time here — a prior mismatch (manifest updated,
+          # this string left stale) made Get-AppxPackage silently find
+          # nothing even though install succeeded.
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          if (-not $pkg) { throw "Package not found after install" }
+          Write-Host "PackageFullName: $($pkg.PackageFullName)"
+          Write-Host "InstallLocation: $($pkg.InstallLocation)"
+
+      - name: Simulate existing user config (pre-upgrade)
+        shell: pwsh
+        run: |
+          $configDir = Join-Path $env:LOCALAPPDATA 'OrderRestro'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          '{"ServerUrl":"http://192.168.1.50:1995"}' | Set-Content (Join-Path $configDir 'config.json')
+
+      - name: Bump version for upgrade-in-place test
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          # Scratch bump on the runner only (not committed) — proves
+          # Add-AppxPackage upgrades this identity in place (same
+          # Name+Publisher, higher Version) instead of requiring an
+          # uninstall first, and that %LOCALAPPDATA% user config survives.
+          # Derived from whatever version is actually committed right now
+          # (bump the Revision field) rather than a hardcoded old->new
+          # literal pair — a literal pair silently stops matching (no
+          # error, the replace just does nothing) the moment the commited
+          # version changes, which would quietly turn this into a no-op
+          # "upgrade" from a version to itself instead of a real test.
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $current = [Version]$manifest.Package.Identity.Version
+          $bumped = [Version]::new($current.Major, $current.Minor, $current.Build, $current.Revision + 1)
+          $bumpedStr = $bumped.ToString()
+          Write-Host "Bumping $current -> $bumpedStr for the upgrade-in-place test"
+          $manifest.Package.Identity.Version = $bumpedStr
+          $manifest.Save((Resolve-Path ./AppxManifest.xml))
+          $csprojContent = Get-Content ./Launcher/Launcher.csproj -Raw
+          if ($csprojContent -notmatch '<Version>[\d.]+</Version>') {
+            throw "Launcher.csproj has no <Version> element to bump"
+          }
+          ($csprojContent -replace '<Version>[\d.]+</Version>', "<Version>$bumpedStr</Version>") |
+            Set-Content ./Launcher/Launcher.csproj
+
+      - name: Build + package upgrade
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          ./build-windows-msix.ps1 -Configuration Release -SelfSignedTest
+
+      - name: Install upgrade in place and verify
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          Add-AppxPackage -Path ./out/OrderRestro.msix -ErrorAction Stop
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          if (-not $pkg) { throw "Package not found after upgrade install" }
+          if ($pkg.Version.ToString() -ne $manifest.Package.Identity.Version) {
+            throw "Expected version $($manifest.Package.Identity.Version) after upgrade, got $($pkg.Version)"
+          }
+          $configPath = Join-Path $env:LOCALAPPDATA 'OrderRestro\config.json'
+          if (-not (Test-Path $configPath)) { throw "Pre-upgrade config.json did not survive the upgrade" }
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          if ($config.ServerUrl -ne 'http://192.168.1.50:1995') {
+            throw "config.json content changed across upgrade: $($config.ServerUrl)"
+          }
+          Write-Host "Upgrade verified: now $($pkg.PackageFullName), user config survived." -ForegroundColor Green
+
+      - name: Run Windows App Certification Kit (WACK)
+        shell: pwsh
+        working-directory: windows/msix
+        timeout-minutes: 20
+        run: |
+          # appcert.exe (WACK) turns out to actually be present on
+          # windows-latest (checked directly, not assumed) — run it for
+          # real against the just-installed package instead of leaving
+          # this permanently "not tested."
+          $appcert = Get-ChildItem "C:\Program Files*\Windows Kits\10\App Certification Kit\appcert.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $appcert) {
+            Write-Host "appcert.exe not found on this runner — skipping WACK." -ForegroundColor Yellow
+            exit 0
+          }
+
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name -ErrorAction SilentlyContinue
+          if (-not $pkg) {
+            Write-Host "No installed package found to run WACK against — skipping." -ForegroundColor Yellow
+            exit 0
+          }
+
+          New-Item -ItemType Directory -Force -Path ./out | Out-Null
+          $reportPath = (Resolve-Path ./out).Path + '\wack-report.xml'
+
+          # Real flag (confirmed via `appcert.exe /?` in CI) is
+          # -reportoutputpath, not -reportoutputxml, and there is no
+          # -apptype option — -packagefullname alone selects the
+          # "installed app" test mode.
+          Write-Host "Running WACK against $($pkg.PackageFullName)... can take several minutes." -ForegroundColor Cyan
+          & $appcert.FullName test -packagefullname $pkg.PackageFullName -reportoutputpath $reportPath
+          Write-Host "appcert.exe exited with code $LASTEXITCODE" -ForegroundColor Cyan
+
+          if (Test-Path $reportPath) {
+            $content = Get-Content $reportPath -Raw
+            if ($content -match '(?i)overall_result[^>]*>\s*([A-Z]+)') {
+              Write-Host "WACK OVERALL_RESULT: $($matches[1])" -ForegroundColor $(if ($matches[1] -eq 'PASS') { 'Green' } else { 'Red' })
+            } else {
+              Write-Host "Report generated but couldn't pattern-match a simple overall result — see the uploaded wack-report.xml artifact." -ForegroundColor Yellow
+            }
+          } else {
+            Write-Host "WACK produced no report file (appcert.exe exit $LASTEXITCODE) — treating as inconclusive." -ForegroundColor Yellow
+          }
+          # Not hard-failing CI on WACK's verdict yet: this is the first
+          # real run of it in this project, and its checks (e.g. Store
+          # association, full digital signature) assume a real Store
+          # submission context this self-signed CI build doesn't have.
+          # Surface the result via the uploaded report for a human to
+          # read rather than silently blocking pushes on an untuned gate.
+          exit 0
+
+      - name: Upload WACK report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrderRestro-wack-report-${{ github.sha }}
+          path: windows/msix/out/wack-report.xml
+          if-no-files-found: warn
+
+      - name: Uninstall (cleanup)
+        if: always()
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name -ErrorAction SilentlyContinue
+          if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName }
+
+      - name: Upload MSIX artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrderRestro-msix-${{ github.sha }}
+          path: windows/msix/out/OrderRestro.msix
+          if-no-files-found: warn
+
+  # Separate job (not a step added to build-and-install above) so the
+  # already-proven thin-client pipeline can't be broken by anything in
+  # here — this exercises the "this PC is the server too" embedded mode
+  # (see ServerSupervisor.cs), which bundles Postgres + a portable Node.js
+  # runtime + the built backend + the built web app into the package.
+  build-and-install-embedded-server:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node.js + pnpm
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+      - shell: pwsh
+        run: corepack enable
+
+      # Node.js/Postgres portable-binary downloads (~80MB combined) —
+      # pinned versions live in stage-server-assets.ps1, so the cache key
+      # only needs to change when that file does.
+      - name: Cache portable Node.js/Postgres downloads
+        uses: actions/cache@v6
+        with:
+          path: windows/msix/out/download-cache
+          key: ${{ runner.os }}-orderrestro-server-downloads-${{ hashFiles('windows/msix/stage-server-assets.ps1') }}
+
+      - name: Add Windows SDK tools (makeappx, signtool) to PATH
+        shell: pwsh
+        run: |
+          $makeappx = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found under any Windows 10/11 SDK bin directory" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $makeappx.FullName -Parent)
+
+      - name: Build + package with embedded server assets
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          ./build-windows-msix.ps1 -Configuration Release -SelfSignedTest -IncludeEmbeddedServer
+
+      - name: Validate package structure
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          ./validate-msix.ps1 -MsixPath ./out/OrderRestro.msix -ExpectEmbeddedServer
+
+      - name: Install package
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          Add-AppxPackage -Path ./out/OrderRestro.msix -ErrorAction Stop
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          if (-not $pkg) { throw "Package not found after install" }
+          Write-Host "InstallLocation: $($pkg.InstallLocation)"
+
+      - name: Launch in embedded-server mode and verify real health checks
+        shell: pwsh
+        # First launch copies the whole embedded-server payload out of the
+        # read-only MSIX install location before anything else can start —
+        # confirmed ~2.8GB / 5+ minutes on CI hardware (see
+        # ServerSupervisor.EnsureRuntimeCopyAsync) — before Postgres,
+        # migrations, and the backend/web processes even get a chance to
+        # start and become healthy.
+        timeout-minutes: 20
+        run: |
+          [xml]$manifest = Get-Content (Join-Path $env:GITHUB_WORKSPACE 'windows\msix\AppxManifest.xml')
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          $exePath = Join-Path $pkg.InstallLocation 'OrderRestro.exe'
+
+          # Pre-seed config.json with Mode=embedded so InitializeAsync skips
+          # FirstRunChoiceForm (a modal dialog — nothing in this job can
+          # click through it) and goes straight into ServerSupervisor.
+          $configDir = Join-Path $env:LOCALAPPDATA 'OrderRestro'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          '{"Mode":"embedded","ServerUrl":"http://localhost:1995"}' | Set-Content (Join-Path $configDir 'config.json')
+
+          Write-Host "Launching $exePath ..." -ForegroundColor Cyan
+          $proc = Start-Process -FilePath $exePath -PassThru
+
+          $supervisorErrorLog = Join-Path $configDir 'server\logs\supervisor-error.log'
+
+          function Wait-Health($url, $timeoutSec) {
+              $deadline = (Get-Date).AddSeconds($timeoutSec)
+              while ((Get-Date) -lt $deadline) {
+                  try {
+                      $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+                      if ($resp.StatusCode -eq 200) { return $true }
+                  } catch { }
+                  # Fail fast instead of waiting out the full timeout: if the
+                  # app already gave up internally (see MainForm's
+                  # StartEmbeddedServerAsync catch block), polling an
+                  # endpoint that will never come up is pure wasted CI time
+                  # — a prior run burned the full 15 minutes this way.
+                  if (Test-Path $script:supervisorErrorLog) {
+                      Write-Host "supervisor-error.log appeared — the app already gave up internally, not waiting out the rest of the timeout." -ForegroundColor Red
+                      Write-Host (Get-Content $script:supervisorErrorLog -Raw) -ForegroundColor Red
+                      return $false
+                  }
+                  Start-Sleep -Seconds 3
+              }
+              return $false
+          }
+
+          $backendOk = Wait-Health 'http://localhost:4001/api/health' 900
+          $webOk = if ($backendOk) { Wait-Health 'http://localhost:1995/api/health' 60 } else { $false }
+
+          # Approximates "another LAN device reaching this PC": hosted
+          # runners have no second machine to test from, but connecting via
+          # the runner's own non-loopback IP (not 127.0.0.1/localhost) at
+          # least exercises real inbound Windows Firewall/network-stack
+          # filtering, unlike a pure loopback request. This is the
+          # empirical signal for whether runFullTrust alone is sufficient
+          # for inbound LAN connections, or whether the
+          # privateNetworkClientServer capability needs to be added.
+          $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+              Select-Object -First 1 -ExpandProperty IPAddress)
+          $lanOk = $null
+          if ($webOk -and $lanIp) {
+              Write-Host "Testing non-loopback reachability via $lanIp ..." -ForegroundColor Cyan
+              $lanOk = Wait-Health "http://${lanIp}:1995/api/health" 20
+              Write-Host "Non-loopback ($lanIp) reachable: $lanOk" -ForegroundColor $(if ($lanOk) { 'Green' } else { 'Yellow' })
+              if (-not $lanOk) {
+                  Write-Host "This suggests runFullTrust alone may not be enough for inbound LAN connections on a packaged app — investigate adding the privateNetworkClientServer capability to AppxManifest.xml before relying on this for real multi-device use." -ForegroundColor Yellow
+              }
+          } else {
+              Write-Host "Skipping non-loopback check (no non-loopback IPv4 found or web wasn't healthy)." -ForegroundColor Yellow
+          }
+
+          if (-not $backendOk -or -not $webOk) {
+              Write-Host "Backend healthy: $backendOk / Web healthy: $webOk" -ForegroundColor Red
+              Write-Host "---- server logs ----" -ForegroundColor Yellow
+              Get-ChildItem (Join-Path $configDir 'server\logs') -ErrorAction SilentlyContinue | ForEach-Object {
+                  Write-Host "== $($_.Name) ==" -ForegroundColor Yellow
+                  Get-Content $_.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80
+              }
+              throw "Embedded server did not become healthy in time"
+          }
+          Write-Host "Both backend and web health checks passed." -ForegroundColor Green
+
+          if (-not (Test-Path (Join-Path $configDir 'server\backend.env'))) {
+              throw "backend.env was not generated on first run"
+          }
+          if (-not (Test-Path (Join-Path $configDir 'server\pgdata\PG_VERSION'))) {
+              throw "Postgres data directory was not initialized (initdb didn't run)"
+          }
+          Write-Host "First-run secret generation and Postgres initdb both verified." -ForegroundColor Green
+
+      - name: Single-instance guard — relaunch while still running must not crash
+        shell: pwsh
+        timeout-minutes: 5
+        # Regression coverage for the actual production report this guard
+        # was added for: embedded-mode installs minimize to the tray
+        # instead of exiting on window close, so a user who thinks they
+        # "closed" the app and reopens it is really launching a second
+        # process against an already-running first one. Before the
+        # Program.cs single-instance Mutex existed, that second process's
+        # own ServerSupervisor collided with the first instance's
+        # exclusively-held backend.log/web.log file handles — "Could not
+        # start the embedded server: The process cannot access the file
+        # ... because it is being used by another process."
+        run: |
+          [xml]$manifest = Get-Content (Join-Path $env:GITHUB_WORKSPACE 'windows\msix\AppxManifest.xml')
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          $exePath = Join-Path $pkg.InstallLocation 'OrderRestro.exe'
+          $configDir = Join-Path $env:LOCALAPPDATA 'OrderRestro'
+          $supervisorErrorLog = Join-Path $configDir 'server\logs\supervisor-error.log'
+
+          $firstProc = Get-Process -Name 'OrderRestro' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $firstProc) { throw "Test setup invalid: the first instance from the previous step isn't running" }
+          $firstPid = $firstProc.Id
+
+          if (Test-Path $supervisorErrorLog) { Remove-Item $supervisorErrorLog -Force }
+
+          Write-Host "Launching a second OrderRestro.exe while the first (PID $firstPid) is still running..." -ForegroundColor Cyan
+          $second = Start-Process -FilePath $exePath -PassThru
+          $exited = $second.WaitForExit(15000)
+          if (-not $exited) {
+              Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
+              throw "Second instance did not exit on its own within 15s — the single-instance mutex guard isn't working"
+          }
+          Write-Host "Second instance exited on its own (mutex guard worked)." -ForegroundColor Green
+
+          if (Test-Path $supervisorErrorLog) {
+              Write-Host (Get-Content $supervisorErrorLog -Raw) -ForegroundColor Red
+              throw "supervisor-error.log appeared — the second instance reached ServerSupervisor.StartAsync instead of being blocked by the mutex"
+          }
+
+          $stillRunning = Get-Process -Id $firstPid -ErrorAction SilentlyContinue
+          if (-not $stillRunning) { throw "The original first instance (PID $firstPid) is no longer running after the second launch" }
+
+          $healthy = $false
+          try {
+              $resp = Invoke-WebRequest -Uri 'http://localhost:1995/api/health' -UseBasicParsing -TimeoutSec 5
+              $healthy = $resp.StatusCode -eq 200
+          } catch { }
+          if (-not $healthy) { throw "The original instance stopped responding to health checks after the second launch attempt" }
+          Write-Host "Original instance (PID $firstPid) is still running and healthy after the second-launch attempt." -ForegroundColor Green
+
+      - name: Forced-shutdown recovery — kill the app, leave Postgres orphaned, relaunch
+        shell: pwsh
+        timeout-minutes: 10
+        # Regression coverage for the production incident this whole
+        # startup-lifecycle rework was written for: a forced kill (Task
+        # Manager, a crash, a Windows shutdown that doesn't run the app's
+        # own OnFormClosing/StopAsync path) leaves postgres.exe running
+        # orphaned with a postmaster.pid on disk. The next launch must
+        # detect and reuse that already-running Postgres via `pg_ctl
+        # status` (see ServerSupervisor.GetPostgresStatusAsync) rather than
+        # failing to start a second instance or mishandling the lock file.
+        # Nothing before this change ever exercised that path in CI.
+        run: |
+          [xml]$manifest = Get-Content (Join-Path $env:GITHUB_WORKSPACE 'windows\msix\AppxManifest.xml')
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name
+          $exePath = Join-Path $pkg.InstallLocation 'OrderRestro.exe'
+          $configDir = Join-Path $env:LOCALAPPDATA 'OrderRestro'
+          $supervisorErrorLog = Join-Path $configDir 'server\logs\supervisor-error.log'
+
+          Write-Host "Force-killing OrderRestro.exe (simulating Task Manager / a crash)..." -ForegroundColor Cyan
+          Get-Process -Name 'OrderRestro' -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+
+          $pgRunning = $false
+          try {
+              $conn = Test-NetConnection -ComputerName 127.0.0.1 -Port 55432 -WarningAction SilentlyContinue
+              $pgRunning = $conn.TcpTestSucceeded
+          } catch { }
+          if (-not $pgRunning) {
+              throw "Test setup invalid: Postgres was not still running after killing the app — this test needs Postgres orphaned, not stopped, to prove anything."
+          }
+          Write-Host "Confirmed: Postgres is still running orphaned (port 55432 reachable), app process is gone." -ForegroundColor Green
+
+          if (Test-Path $supervisorErrorLog) { Remove-Item $supervisorErrorLog -Force }
+
+          Write-Host "Relaunching OrderRestro against the orphaned Postgres..." -ForegroundColor Cyan
+          Start-Process -FilePath $exePath
+
+          function Wait-Health($url, $timeoutSec) {
+              $deadline = (Get-Date).AddSeconds($timeoutSec)
+              while ((Get-Date) -lt $deadline) {
+                  try {
+                      $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+                      if ($resp.StatusCode -eq 200) { return $true }
+                  } catch { }
+                  if (Test-Path $supervisorErrorLog) {
+                      Write-Host "supervisor-error.log appeared on relaunch:" -ForegroundColor Red
+                      Write-Host (Get-Content $supervisorErrorLog -Raw) -ForegroundColor Red
+                      return $false
+                  }
+                  Start-Sleep -Seconds 3
+              }
+              return $false
+          }
+
+          $recovered = Wait-Health 'http://localhost:1995/api/health' 120
+          if (-not $recovered) {
+              Write-Host "---- startup.log ----" -ForegroundColor Yellow
+              Get-Content (Join-Path $configDir 'server\logs\startup.log') -ErrorAction SilentlyContinue | Select-Object -Last 40
+              throw "OrderRestro did not recover after a forced kill left Postgres orphaned"
+          }
+          Write-Host "Recovered cleanly: relaunch reused the orphaned Postgres instance." -ForegroundColor Green
+
+          $startupLog = Get-Content (Join-Path $configDir 'server\logs\startup.log') -Raw -ErrorAction SilentlyContinue
+          if ($startupLog -notmatch 'existing postgres process detection: Running') {
+              throw "startup.log doesn't show the relaunch detected the already-running Postgres instance — check GetPostgresStatusAsync"
+          }
+          Write-Host "Confirmed via startup.log: relaunch correctly detected and reused the existing Postgres instance (not a fresh start)." -ForegroundColor Green
+
+      - name: Stop embedded server and app (cleanup)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process -Name 'OrderRestro' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # pg_ctl runs from the writable runtime copy, not the MSIX
+          # install location (see ServerPaths.RuntimeServerDir / the
+          # "Access is denied" comment on EnsureRuntimeCopyAsync) — use
+          # that same copy here too, not $pkg.InstallLocation.
+          $pgCtl = Join-Path $env:LOCALAPPDATA 'OrderRestro\server\server-runtime\postgres\bin\pg_ctl.exe'
+          $pgData = Join-Path $env:LOCALAPPDATA 'OrderRestro\server\pgdata'
+          if ((Test-Path $pgCtl) -and (Test-Path $pgData)) {
+              & $pgCtl stop -D $pgData -m immediate -w 2>&1 | Out-Null
+          }
+
+      - name: Uninstall (cleanup)
+        if: always()
+        shell: pwsh
+        working-directory: windows/msix
+        run: |
+          [xml]$manifest = Get-Content ./AppxManifest.xml
+          $pkg = Get-AppxPackage -Name $manifest.Package.Identity.Name -ErrorAction SilentlyContinue
+          if ($pkg) { Remove-AppxPackage -Package $pkg.PackageFullName }
+
+      - name: Upload embedded-server MSIX artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrderRestro-embedded-server-msix-${{ github.sha }}
+          path: windows/msix/out/OrderRestro.msix
+          if-no-files-found: warn
