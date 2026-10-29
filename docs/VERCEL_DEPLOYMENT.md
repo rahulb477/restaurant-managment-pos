@@ -2,13 +2,28 @@
 
 The current production request path is `apps/web` (Next.js App Router). It serves the UI and `/api/v1/*` route handlers. Those handlers implement the app's Firebase-backed API; they do **not** proxy to NestJS. The web runtime does **not** start NestJS, PostgreSQL, Prisma, Socket.IO, or write durable files to local disk.
 
-The repository-root `vercel.json` declares `web` and `backend` as Vercel services. Only `web` is publicly routed (all paths); `backend` is internal and receives no public traffic. This is deliberately conservative: routing `/api/*` to Nest would shadow the existing Next `/api/v1/*` handlers, and the current web code has no fixed call to the Nest service. No service binding is therefore configured. The Nest service's compatibility with Vercel's runtime and its external dependencies still need deployment validation before making it public or wiring it to the web service.
+The repository-root `vercel.json` declares **only** the `web` service (`apps/web`, Next.js) and routes `/(.*)` to it. `apps/backend` remains in the repository for legacy and migration use, but is not a Vercel service. The web service runs `pnpm install --frozen-lockfile --filter web...` to install only web and its workspace dependencies, then `pnpm --filter @nodedr-restaurant/types build && pnpm --filter web build`; it does not run the repository's unfiltered `turbo run build`, which also selects the legacy NestJS backend.
 
 Do not deploy until Firebase Admin, Firestore rules, and ImgBB are configured. This document does not claim a live deploy succeeded.
 
-## Service build configuration
+## Vercel project and dashboard settings
 
-The service roots and frameworks are declared in `vercel.json`: `apps/backend` (NestJS) and `apps/web` (Next.js). The repository uses a shared pnpm workspace and lockfile. Keep build/install settings scoped to the service that needs them; services mode does not allow those build/runtime settings at the top level. The repository's Node engine requirement is **22.x**.
+The project must use the repository root so Vercel reads the root `vercel.json`, `pnpm-workspace.yaml`, and lockfile. `services.web.root` selects `apps/web` and its Next.js framework. Keep build/install configuration **inside** `services.web`: Services mode does not support top-level build/install overrides in `vercel.json`. Leave the `/(.*)` rewrite pointed at `web` so Next.js serves the existing `/api/v1/*` handlers as well as the UI.
+
+In the Vercel dashboard, open the **same project and environment** that produced the failed deployment. Check **Settings → Build and Deployment** (or **General → Build & Development Settings**, depending on the dashboard version), and **Settings → General**:
+
+| Setting | Required value |
+|---|---|
+| **Root Directory** | Repository root (`.` / empty), not `apps/web` or `apps/backend`. |
+| **Framework** | Use Services mode and leave framework selection to `services.web.framework: "nextjs"`; don't replace the service configuration with a root-level framework override. |
+| **Build Command** | Turn the dashboard **Override off** so `services.web.buildCommand` is used. If an override is required, set exactly `pnpm --filter @nodedr-restaurant/types build && pnpm --filter web build`; do not use `turbo run build` or `pnpm build`. |
+| **Install Command** | Turn **Override off** so `services.web.installCommand` is used; if an override is required, use `pnpm install --frozen-lockfile --filter web...`, not a build command. |
+| **Output Directory** | Turn **Override off**; the web service's Next.js builder handles `.next`. |
+| **Node.js Version** | **22.x**, consistent with the root `package.json` engine. |
+
+Under **Settings → Environment Variables**, set `ENABLE_EXPERIMENTAL_COREPACK=1` for the Development environment so Vercel uses the root `packageManager` pin, `pnpm@11.10.0`. Apply it to any other non-production environment you intend to deploy, then redeploy that environment. Confirm the install log reports pnpm 11.10.0. Vercel can otherwise select a different pnpm version from the lockfile and project creation date; for example, pnpm 9 fails the frozen install because it does not match this workspace's lockfile overrides. Do not change the lockfile to work around that version mismatch.
+
+Dashboard overrides and Git/environment selection cannot be verified from the repository alone. After pushing the fix to the branch used by this project, open the new **Development** deployment and check its **Source** branch and commit SHA. Inspect its build log: the selected service should be `web`, the build command should be the filtered command above, and `@nodedr-restaurant/backend#build` must not run. If the log still says `turbo run build`, recheck the project/environment overrides, Root Directory, and deployed commit before retrying. A branch deployment can be triggered by the Git integration; verify that this branch is not configured as the production branch before pushing if a production deployment is not intended.
 
 Do **not** set `BACKEND_URL`. The web app's `next.config.ts` has no rewrite to Nest, and no application code currently calls a fixed internal backend URL.
 
