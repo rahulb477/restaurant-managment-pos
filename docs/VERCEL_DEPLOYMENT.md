@@ -1,16 +1,28 @@
 # Vercel deployment
 
-The current production request path is `apps/web` (Next.js App Router). It serves the UI and `/api/v1/*` route handlers. Those handlers implement the app's Firebase-backed API; they do **not** proxy to NestJS. The web runtime does **not** start NestJS, PostgreSQL, Prisma, Socket.IO, or write durable files to local disk.
+The active Vercel production runtime is **only** `apps/web` (Next.js App Router). It serves the UI and `/api/v1/*` route handlers, which implement the app's Firebase-backed API and ImgBB uploads directly; they do **not** proxy to NestJS. `apps/backend` (`@nodedr-restaurant/backend`) is retained in the repository for legacy/reference and data-migration purposes only and is **not** built or deployed on Vercel. The web runtime does **not** start NestJS, PostgreSQL, Prisma, Socket.IO, or write durable files to local disk.
 
-The repository-root `vercel.json` declares `web` and `backend` as Vercel services. Only `web` is publicly routed (all paths); `backend` is internal and receives no public traffic. This is deliberately conservative: routing `/api/*` to Nest would shadow the existing Next `/api/v1/*` handlers, and the current web code has no fixed call to the Nest service. No service binding is therefore configured. The Nest service's compatibility with Vercel's runtime and its external dependencies still need deployment validation before making it public or wiring it to the web service.
+The repository-root `vercel.json` declares only the `web` service (`apps/web`, Next.js) and routes all public traffic (`/(.*)`) to `web`. Keeping the repository root as the Vercel project root preserves the shared `pnpm` workspace (`pnpm-workspace.yaml`, `pnpm-lock.yaml`, and `@nodedr-restaurant/types`), while scoping `installCommand` and `buildCommand` under `services.web` ensures Vercel builds only `@nodedr-restaurant/types` and `web` instead of running `turbo run build` across `@nodedr-restaurant/backend`.
 
 Do not deploy until Firebase Admin, Firestore rules, and ImgBB are configured. This document does not claim a live deploy succeeded.
 
-## Service build configuration
+## Vercel dashboard settings
 
-The service roots and frameworks are declared in `vercel.json`: `apps/backend` (NestJS) and `apps/web` (Next.js). The repository uses a shared pnpm workspace and lockfile. Keep build/install settings scoped to the service that needs them; services mode does not allow those build/runtime settings at the top level. The repository's Node engine requirement is **22.x**.
+Configure the project in the Vercel dashboard (**Settings → Build and Deployment** and **Settings → General**) as follows:
 
-Do **not** set `BACKEND_URL`. The web app's `next.config.ts` has no rewrite to Nest, and no application code currently calls a fixed internal backend URL.
+| Setting | Value |
+|---|---|
+| **Root Directory** | **Repository root** (leave empty / `.`) |
+| **Framework Preset** | Controlled by `vercel.json` (`services.web.framework: "nextjs"` — leave default / `Services` / `Next.js`) |
+| **Build Command** | **Override Off** (uses `vercel.json`: `pnpm --filter @nodedr-restaurant/types build && pnpm --filter web build`). If Override is enabled manually, set it to that exact command — **never** `turbo run build` or `pnpm build`. |
+| **Output Directory** | **Override Off** (Next.js default for `apps/web`, i.e. `.next` within `services.web`) |
+| **Install Command** | **Override Off** (uses `vercel.json`: `pnpm install`). If Override is enabled manually, set to `pnpm install`. |
+| **Ignored Build Step** | Leave empty |
+| **Node.js Version** | **22.x** (note: root `package.json` specifies `"engines": { "node": ">=22" }`) |
+
+Keep `installCommand` and `buildCommand` inside `services.web` in `vercel.json`; Vercel Services mode rejects top-level `buildCommand` / `installCommand` / `framework` / `outputDirectory` properties, and running `@vercel/next` directly against the repository root without `services.web` would fail Next.js version detection because `next` is declared in `apps/web/package.json` rather than root `package.json`.
+
+Do **not** set `BACKEND_URL`. The web app's `next.config.ts` has no rewrite to Nest, and no application code calls a Nest backend URL.
 
 ## Environment variables
 
