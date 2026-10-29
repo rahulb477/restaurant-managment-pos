@@ -155,6 +155,15 @@ export class AuthController {
     return { user };
   }
 
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('password-reset')
+  async passwordReset(@Body() body: { email?: string }) {
+    if (!body?.email || typeof body.email !== 'string') {
+      return { ok: true };
+    }
+    return this.authService.requestPasswordReset(body.email);
+  }
+
   // Public and unauthenticated — the marketing/login page needs this before
   // anyone is signed in, to decide whether to show the full landing pitch
   // (no restaurant registered on this instance yet) or just Sign in + View

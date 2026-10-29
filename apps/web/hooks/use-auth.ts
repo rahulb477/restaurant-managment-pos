@@ -35,6 +35,12 @@ export function useRegister() {
   });
 }
 
+export function usePasswordReset() {
+  return useMutation({
+    mutationFn: (email: string) => api.post("/auth/password-reset", { email }),
+  });
+}
+
 export function useLogout() {
   const queryClient = useQueryClient();
   return useMutation({

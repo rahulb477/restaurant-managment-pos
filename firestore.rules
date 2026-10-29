@@ -1,0 +1,107 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function sameRestaurant(rid) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && userDoc().restaurantId == rid
+        && userDoc().isActive == true;
+    }
+
+    function denyClientWrites() {
+      return false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /restaurants/{rid} {
+      allow read: if sameRestaurant(rid);
+      allow write: if denyClientWrites();
+    }
+
+    match /branches/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || sameRestaurant(resource.data.restaurantId));
+      allow write: if denyClientWrites();
+    }
+
+    match /roles/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /menuCategories/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /menuItems/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /tables/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /orders/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /orderItems/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /kitchenTickets/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /payments/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /refunds/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /stockMovements/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /payrollRuns/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /auditLogs/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+
+    match /images/{id} {
+      allow read: if sameRestaurant(resource.data.restaurantId);
+      allow write: if denyClientWrites();
+    }
+  }
+}
